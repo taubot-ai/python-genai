@@ -440,13 +440,53 @@ class HttpResponse:
 
   @classmethod
   def _load_json_from_response(cls, response: Any) -> Any:
-    """Loads JSON from the response, or raises an error if the parsing fails."""
+    """Loads JSON from the response, handling malformed responses gracefully.
+
+    Gemini models with "thinking mode" may include fields like `thoughtSignature`
+    that can cause JSON parsing issues when responses are streamed in chunks.
+    This method attempts to parse JSON and falls back to returning an empty
+    dict for truly malformed responses to avoid breaking streaming flows.
+
+    See: https://github.com/googleapis/python-genai/issues/1162
+    """
+    if not response:
+      return {}
+
     try:
       return json.loads(response)
-    except json.JSONDecodeError as e:
-      raise errors.UnknownApiResponseError(
-          f'Failed to parse response as JSON. Raw response: {response}'
-      ) from e
+    except json.JSONDecodeError:
+      # Try to extract valid JSON by finding balanced braces
+      # This handles cases where thoughtSignature or other fields cause issues
+      try:
+        # Find the first { and attempt to parse from there
+        if isinstance(response, str):
+          start_idx = response.find('{')
+          if start_idx >= 0:
+            # Try to find a valid JSON object
+            brace_count = 0
+            end_idx = -1
+            for i, char in enumerate(response[start_idx:], start=start_idx):
+              if char == '{':
+                brace_count += 1
+              elif char == '}':
+                brace_count -= 1
+                if brace_count == 0:
+                  end_idx = i + 1
+                  break
+
+            if end_idx > start_idx:
+              candidate = response[start_idx:end_idx]
+              return json.loads(candidate)
+      except (json.JSONDecodeError, ValueError):
+        pass
+
+      # Log warning but don't raise - return empty dict to avoid breaking streaming
+      logger.warning(
+          'Failed to parse response as JSON, returning empty dict. '
+          'Raw response (truncated): %s',
+          response[:500] if isinstance(response, str) else str(response)[:500]
+      )
+      return {}
 
 
 # Default retry options.
