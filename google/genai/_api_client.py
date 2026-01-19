@@ -30,6 +30,7 @@ import logging
 import math
 import os
 import random
+import re
 import ssl
 import sys
 import threading
@@ -439,54 +440,162 @@ class HttpResponse:
         self.response_stream.release()
 
   @classmethod
-  def _load_json_from_response(cls, response: Any) -> Any:
-    """Loads JSON from the response, handling malformed responses gracefully.
+  def _extract_nested_json_object(cls, text: str, start_pos: int) -> Optional[str]:
+    """Extract a complete JSON object starting at start_pos, handling nesting.
+    
+    Properly handles nested braces and braces inside quoted strings.
+    Returns the JSON string if found, None otherwise.
+    """
+    if start_pos >= len(text) or text[start_pos] != '{':
+      return None
+    
+    brace_count = 0
+    in_string = False
+    escape_next = False
+    
+    for i, char in enumerate(text[start_pos:], start=start_pos):
+      if escape_next:
+        escape_next = False
+        continue
+      if char == '\\' and in_string:
+        escape_next = True
+        continue
+      if char == '"' and not escape_next:
+        in_string = not in_string
+        continue
+      if in_string:
+        continue
+      if char == '{':
+        brace_count += 1
+      elif char == '}':
+        brace_count -= 1
+        if brace_count == 0:
+          return text[start_pos:i+1]
+    
+    return None
 
-    Gemini models with "thinking mode" may include fields like `thoughtSignature`
-    that can cause JSON parsing issues when responses are streamed in chunks.
-    This method attempts to parse JSON and falls back to returning an empty
-    dict for truly malformed responses to avoid breaking streaming flows.
+  @classmethod
+  def _calculate_json_closing_sequence(cls, text: str) -> str:
+    """Calculate the correct closing sequence for unclosed JSON structures.
+    
+    Tracks opening brackets/braces and returns the closing chars needed,
+    properly accounting for characters inside quoted strings.
+    """
+    stack = []
+    in_string = False
+    escape_next = False
+    
+    for char in text:
+      if escape_next:
+        escape_next = False
+        continue
+      if char == '\\' and in_string:
+        escape_next = True
+        continue
+      if char == '"':
+        in_string = not in_string
+        continue
+      if in_string:
+        continue
+      if char == '{':
+        stack.append('}')
+      elif char == '[':
+        stack.append(']')
+      elif char == '}':
+        if stack and stack[-1] == '}':
+          stack.pop()
+      elif char == ']':
+        if stack and stack[-1] == ']':
+          stack.pop()
+    
+    return ''.join(reversed(stack))
+
+  @classmethod
+  def _load_json_from_response(cls, response: Any) -> Any:
+    """Loads JSON from the response, recovering data from truncated responses.
+
+    Gemini models with "thinking mode" include `thoughtSignature` fields that
+    can cause JSON parsing issues when responses are streamed in chunks (the
+    signature is very long and may truncate the response). This method:
+    
+    1. Tries direct JSON parsing
+    2. Truncates at thoughtSignature and repairs the JSON structure
+    3. Extracts functionCall objects directly as last resort
+    
+    The goal is to preserve functionCall data even when thoughtSignature
+    causes truncation, rather than returning empty dict and losing the call.
 
     See: https://github.com/googleapis/python-genai/issues/1162
     """
     if not response:
       return {}
 
+    # Strategy 0: Direct parsing (fast path for valid JSON)
     try:
       return json.loads(response)
     except json.JSONDecodeError:
-      # Try to extract valid JSON by finding balanced braces
-      # This handles cases where thoughtSignature or other fields cause issues
-      try:
-        # Find the first { and attempt to parse from there
-        if isinstance(response, str):
-          start_idx = response.find('{')
-          if start_idx >= 0:
-            # Try to find a valid JSON object
-            brace_count = 0
-            end_idx = -1
-            for i, char in enumerate(response[start_idx:], start=start_idx):
-              if char == '{':
-                brace_count += 1
-              elif char == '}':
-                brace_count -= 1
-                if brace_count == 0:
-                  end_idx = i + 1
-                  break
-
-            if end_idx > start_idx:
-              candidate = response[start_idx:end_idx]
-              return json.loads(candidate)
-      except (json.JSONDecodeError, ValueError):
-        pass
-
-      # Log warning but don't raise - return empty dict to avoid breaking streaming
-      logger.warning(
-          'Failed to parse response as JSON, returning empty dict. '
-          'Raw response (truncated): %s',
-          response[:500] if isinstance(response, str) else str(response)[:500]
-      )
+      pass
+    
+    if not isinstance(response, str):
       return {}
+
+    # Strategy 1: Truncate at thoughtSignature and repair JSON structure
+    # This preserves the most data (including functionCall with full context)
+    try:
+      ts_match = re.search(r',\s*"thoughtSignature"\s*:', response)
+      if ts_match:
+        stripped = response[:ts_match.start()]
+        closing = cls._calculate_json_closing_sequence(stripped)
+        repaired = stripped + closing
+        result = json.loads(repaired)
+        logger.debug(
+            'Recovered JSON by truncating at thoughtSignature. '
+            'Original length: %d, repaired length: %d',
+            len(response), len(repaired)
+        )
+        return result
+    except (json.JSONDecodeError, ValueError, AttributeError):
+      pass
+
+    # Strategy 2: Extract functionCall directly (preserves critical tool call data)
+    try:
+      fc_match = re.search(r'"functionCall"\s*:\s*', response)
+      if fc_match:
+        fc_obj = cls._extract_nested_json_object(response, fc_match.end())
+        if fc_obj:
+          fc_data = json.loads(fc_obj)
+          result = {
+              "candidates": [{
+                  "content": {
+                      "parts": [{"functionCall": fc_data}]
+                  }
+              }]
+          }
+          logger.debug(
+              'Recovered functionCall from malformed response: %s',
+              fc_data.get('name', 'unknown')
+          )
+          return result
+    except (json.JSONDecodeError, ValueError):
+      pass
+
+    # Strategy 3: Simple brace-balancing (original fallback)
+    try:
+      start_idx = response.find('{')
+      if start_idx >= 0:
+        obj = cls._extract_nested_json_object(response, start_idx)
+        if obj:
+          return json.loads(obj)
+    except (json.JSONDecodeError, ValueError):
+      pass
+
+    # All strategies failed - log and return empty dict
+    logger.warning(
+        'Failed to parse response as JSON, returning empty dict. '
+        'Raw response (truncated): %s',
+        response[:500] if isinstance(response, str) else str(response)[:500]
+    )
+    return {}
 
 
 # Default retry options.
